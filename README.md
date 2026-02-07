@@ -68,7 +68,8 @@ Sliding window rate limit (10 req / 60s per IP) ทำงานที่ Edge �
 **ต้องมี:** [Bun](https://bun.sh/), account [Neon](https://console.neon.tech/) + [Upstash](https://console.upstash.com/) (free tier)
 
 ```bash
-git clone <your-repo-url> url-shortener && cd url-shortener
+git clone https://github.com/earthchx/url-shortener
+cd url-shortener
 bun install
 cp .env.example .env.local   # แล้วใส่ credentials
 bun run db:push               # สร้าง table ใน Neon
