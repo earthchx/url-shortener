@@ -1,230 +1,121 @@
-# ✂️ Snip — High-Performance URL Shortener
+# Snip — URL Shortener
 
-A production-ready, serverless URL shortener built with **Next.js**, **Neon Postgres**, **Upstash Redis**, and **Drizzle ORM**. Runs entirely on free-tier infrastructure.
+URL shortener ที่ผมทำเพื่อลองเล่น **caching strategy** จริงจัง — ใช้ Redis เป็น layer หน้า Postgres แล้ว deploy ขึ้น Vercel ทั้งหมดบน free tier
 
----
+> **Live demo:** [sniplink-earthchx.vercel.app](https://sniplink-earthchx.vercel.app)
 
-## 🏗️ Architecture
-
-```
-┌──────────────┐     ┌────────────────────┐     ┌──────────────┐
-│   Browser    │────▶│   Edge Middleware   │────▶│  Next.js App │
-│              │     │  (Rate Limiting)    │     │  (App Router)│
-└──────────────┘     └────────────────────┘     └──────┬───────┘
-                                                       │
-                              ┌─────────────────────────┤
-                              │                         │
-                     ┌────────▼────────┐     ┌──────────▼──────────┐
-                     │  Upstash Redis  │     │   Neon Postgres     │
-                     │  • ID Counter   │     │   • links table     │
-                     │  • URL Cache    │     │   • Persistent store │
-                     │  • Rate Limits  │     │                     │
-                     └─────────────────┘     └─────────────────────┘
-```
-
-### Request Flows
-
-**Shorten a URL (`POST /api/shorten`):**
-```
-Client → Edge Middleware (rate limit check)
-  → Server Action / API Route
-    → Redis: dedup check (url → code)
-    → DB: dedup check (fallback)
-    → Redis INCR → Base62 encode → short code
-    → DB INSERT (persist)
-    → Redis SET (cache both directions)
-  → Return short URL
-```
-
-**Redirect (`GET /:shortCode`):**
-```
-Client → Route Handler
-  → Redis GET (cache hit? → 302 redirect, ~1ms)
-  → DB SELECT  (cache miss? → populate cache → 302 redirect)
-  → visits++ (fire-and-forget, non-blocking)
-```
+![Snip Screenshot](./docs/snip_screenshot.png)
 
 ---
 
-## 🧠 Key Design Decisions
+## ทำไมถึงทำ project นี้
 
-### Why Base62 + Redis `INCR`?
+อยากลองออกแบบ backend ที่คิดเรื่อง performance ตั้งแต่ต้น ไม่ใช่แค่ CRUD ธรรมดา เลยเลือก URL shortener เพราะมันเป็น problem ที่เล็กพอจะทำคนเดียว แต่มี design decisions ที่น่าสนใจเยอะ เช่น:
 
-| Approach | Collision Risk | Speed | Length |
-|---|---|---|---|
-| UUID v4 | None | Fast | 36 chars ❌ |
-| nanoid | Tiny but real | Fast | 21 chars |
-| **Redis INCR + Base62** | **Zero** | **O(1)** | **3-6 chars ✅** |
-
-Redis `INCR` is **atomic** — even under 10K concurrent requests, every caller gets a unique integer. Converting to Base62 gives us short, URL-safe strings: 6 characters can encode **~56 billion** unique IDs.
-
-The counter starts at `10,000` so the very first short code is 3 characters (`2Bi`).
-
-### Why Cache-Aside Pattern?
-
-- **Write path:** After creating a link, we cache `code→url` AND `url→code` in Redis.
-- **Read path:** Redirect checks Redis first (sub-ms). On a miss, it queries Neon, then back-fills the cache with a 24h TTL.
-- **Dedup:** If the same URL is submitted again, we return the existing code instantly from cache.
-
-### Why Sliding Window Rate Limiting?
-
-Fixed-window rate limiting has a burst problem at boundaries (e.g., 10 reqs at second 59 + 10 at second 0 = 20 in 1 real second). Sliding window smooths this out with only ~2 Redis commands per check.
+- **จะสร้าง short code ยังไงให้ไม่ซ้ำ** โดยไม่ต้อง check DB ทุกครั้ง?
+- **จะ redirect ให้เร็วได้แค่ไหน** ถ้าวาง cache ดีๆ?
+- **จะป้องกัน spam** ยังไง โดยไม่กระทบ UX?
 
 ---
 
-## 🛠️ Tech Stack
+## สิ่งที่น่าสนใจในโปรเจกต์นี้
 
-| Layer | Technology | Why |
+### Short Code Generation — Redis INCR + Base62
+
+ใช้ Redis `INCR` (atomic counter) แทน UUID หรือ random string เพราะ:
+
+- **Zero collision** — ทุก request ได้เลขไม่ซ้ำกัน
+- **สั้น** — `10000` → `"2Bi"` (3 ตัวอักษร), 6 ตัวอักษรรองรับ ~56 พันล้าน IDs
+- **เร็ว** — O(1), ไม่ต้อง round-trip ไป DB
+
+### Caching — Redis → Postgres
+
+Redirect (`GET /2Bi`) ใช้ cache-aside pattern:
+
+```
+1. Check Redis cache → hit? → 302 redirect (~5ms)
+2. Cache miss → query Neon Postgres → populate cache → redirect
+3. Visit counter++ แบบ fire-and-forget (ไม่ block response)
+```
+
+ตอนสร้าง link ใหม่ก็ cache ทั้งสองทิศทาง:
+- `code → url` สำหรับ redirect
+- `url → code` สำหรับ dedup (ส่ง URL ซ้ำ → ได้ code เดิม)
+
+### Rate Limiting ที่ Edge
+
+Sliding window rate limit (10 req / 60s per IP) ทำงานที่ Edge ก่อนถึง API route — spam ถูก block ตั้งแต่ layer แรก โดยไม่กระทบ redirect performance
+
+---
+
+## Tech Stack
+
+| | Technology | ทำไมถึงเลือก |
 |---|---|---|
-| Framework | Next.js (App Router) | Server Actions, Edge Middleware, file-based routing |
-| Language | TypeScript (strict) | No `any`, fully typed API responses |
-| Database | Neon Postgres | Serverless, scales to zero, free tier |
-| ORM | Drizzle ORM | Type-safe, lightweight, great DX |
-| Cache & IDs | Upstash Redis | HTTP-based, Edge-compatible, atomic INCR |
-| Rate Limiting | @upstash/ratelimit | Sliding window, built on Redis |
-| Validation | Zod | Runtime schema validation for env + input |
-| UI | shadcn/ui + Tailwind CSS | Accessible components, utility-first styling |
-| Deployment | Vercel | Edge Runtime, zero-config, free tier |
+| **Framework** | Next.js 16 (App Router) | Server Actions, Edge Runtime |
+| **Database** | [Neon](https://neon.tech) Postgres | Serverless, scale to zero, free tier |
+| **Cache** | [Upstash](https://upstash.com) Redis | HTTP-based (Edge-compatible), atomic INCR |
+| **ORM** | Drizzle | Type-safe, lightweight |
+| **Deploy** | [Vercel](https://vercel.com) | Push to GitHub → deploy, free tier |
+| **UI** | shadcn/ui + Tailwind | ไม่ใช่ focus หลัก แต่ก็ดูดีในระดับนึง |
+
+ทุกอย่างเป็น **HTTP-based** หมด — ไม่ต้อง TCP connection, ทำงานบน Edge Runtime ได้เลย
 
 ---
 
-## 📁 Project Structure
+## Getting Started
 
-```
-├── app/
-│   ├── [shortCode]/route.ts    # GET /:code → Redis/DB lookup → 302 redirect
-│   ├── api/shorten/route.ts    # POST /api/shorten (REST endpoint)
-│   ├── actions.ts              # Server Action (form submission)
-│   ├── layout.tsx              # Root layout
-│   ├── page.tsx                # Home page (ShortenForm)
-│   └── not-found.tsx           # Custom 404 page
-├── components/
-│   ├── shorten-form.tsx        # Client component — URL input + result display
-│   └── ui/                     # shadcn/ui primitives (Button, Input, Card, etc.)
-├── lib/
-│   ├── db/
-│   │   ├── index.ts            # Drizzle + Neon HTTP connection
-│   │   └── schema.ts           # `links` table definition
-│   ├── base62.ts               # Base62 encode/decode
-│   ├── env.ts                  # Zod-validated environment variables
-│   ├── rate-limit.ts           # Upstash sliding-window rate limiter
-│   ├── redis.ts                # Redis client + key namespace
-│   ├── short-code.ts           # Redis INCR → Base62 short code generator
-│   ├── types.ts                # Shared API response types
-│   ├── utils.ts                # cn() utility for Tailwind
-│   └── validations.ts          # Zod schema for URL input
-├── middleware.ts                # Edge middleware (rate limiting)
-├── drizzle.config.ts           # Drizzle Kit configuration
-└── .env.example                # Template for environment variables
-```
-
----
-
-## 🚀 Getting Started
-
-### Prerequisites
-
-- [Bun](https://bun.sh/) (v1.0+)
-- [Neon](https://console.neon.tech/) account (free tier)
-- [Upstash](https://console.upstash.com/) account (free tier)
-
-### 1. Clone & Install
+**ต้องมี:** [Bun](https://bun.sh/), account [Neon](https://console.neon.tech/) + [Upstash](https://console.upstash.com/) (free tier)
 
 ```bash
-git clone <your-repo-url> url-shortener
-cd url-shortener
+git clone <your-repo-url> url-shortener && cd url-shortener
 bun install
+cp .env.example .env.local   # แล้วใส่ credentials
+bun run db:push               # สร้าง table ใน Neon
+bun dev                        # เปิด http://localhost:3000
 ```
 
-### 2. Configure Environment
+### Environment Variables
 
-```bash
-cp .env.example .env.local
-```
-
-Fill in your credentials:
-
-| Variable | Where to get it |
+| Variable | ได้จากไหน |
 |---|---|
-| `DATABASE_URL` | [Neon Console](https://console.neon.tech/) → Connection string |
-| `UPSTASH_REDIS_REST_URL` | [Upstash Console](https://console.upstash.com/) → REST API URL |
-| `UPSTASH_REDIS_REST_TOKEN` | [Upstash Console](https://console.upstash.com/) → REST API Token |
-| `NEXT_PUBLIC_BASE_URL` | `http://localhost:3000` for dev, your domain for prod |
+| `DATABASE_URL` | Neon Console → Connection string |
+| `UPSTASH_REDIS_REST_URL` | Upstash Console → REST API |
+| `UPSTASH_REDIS_REST_TOKEN` | Upstash Console → REST API |
+| `NEXT_PUBLIC_BASE_URL` | `http://localhost:3000` (dev) หรือ domain จริง |
 
-### 3. Push Database Schema
+---
+
+## Deploy
 
 ```bash
-bun run db:push
+# Push ขึ้น GitHub แล้วไป vercel.com/new → Import → ใส่ env vars → Deploy
 ```
 
-### 4. Run Development Server
+แค่นั้นเลย Neon กับ Upstash ใช้ HTTP driver หมด ไม่ต้อง config อะไรเพิ่ม
+
+---
+
+## API
+
+**สร้าง short link:**
 
 ```bash
-bun dev
+curl -X POST http://localhost:3000/api/shorten \
+  -H 'Content-Type: application/json' \
+  -d '{"url": "https://example.com/long-url"}'
+
+# → { "success": true, "shortUrl": "http://localhost:3000/2Bi", "shortCode": "2Bi" }
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+**Redirect:**
 
-### 5. (Optional) Open Drizzle Studio
-
-```bash
-bun run db:studio
+```
+GET /2Bi → 302 redirect → https://example.com/long-url
 ```
 
 ---
 
-## 📡 API Reference
-
-### `POST /api/shorten`
-
-Shorten a URL.
-
-**Request:**
-```json
-{ "url": "https://example.com/very/long/path" }
-```
-
-**Success (201):**
-```json
-{
-  "success": true,
-  "shortUrl": "http://localhost:3000/2Bi",
-  "shortCode": "2Bi"
-}
-```
-
-**Validation Error (400):**
-```json
-{ "success": false, "error": "Please enter a valid URL" }
-```
-
-**Rate Limited (429):**
-```json
-{ "success": false, "error": "Too many requests. Please try again later." }
-```
-
-Rate limit headers are always included:
-- `X-RateLimit-Limit` — Max requests per window
-- `X-RateLimit-Remaining` — Remaining requests
-- `X-RateLimit-Reset` — Window reset timestamp
-
-### `GET /:shortCode`
-
-Redirects to the original URL (302) or returns 302 to `/?error=not-found`.
-
----
-
-## 🚢 Deploy to Vercel
-
-1. Push your code to GitHub.
-2. Import the repo on [vercel.com/new](https://vercel.com/new).
-3. Add the environment variables in the Vercel dashboard.
-4. Deploy — done.
-
-The app works with Vercel's Edge Runtime out of the box. Both Neon and Upstash use HTTP-based drivers, so no TCP connections are needed.
-
----
-
-## 📄 License
+## License
 
 MIT
